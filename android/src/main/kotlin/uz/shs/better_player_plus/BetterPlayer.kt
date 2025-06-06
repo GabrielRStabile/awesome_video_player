@@ -11,10 +11,6 @@ import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Build
 import android.os.Handler
-import android.os.Looper
-import android.support.v4.media.MediaMetadataCompat
-import android.support.v4.media.session.MediaSessionCompat
-import android.support.v4.media.session.PlaybackStateCompat
 import uz.shs.better_player_plus.DataSourceUtils.getUserAgent
 import uz.shs.better_player_plus.DataSourceUtils.isHTTP
 import uz.shs.better_player_plus.DataSourceUtils.getDataSourceFactory
@@ -37,13 +33,13 @@ import androidx.work.Data
 import androidx.media3.*
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
-import androidx.media3.common.ForwardingPlayer
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
 import androidx.media3.common.Timeline
 import androidx.media3.common.TrackSelectionOverride
+import androidx.media3.common.util.UnstableApi
 import androidx.media3.common.util.Util
 import androidx.media3.datasource.DataSource
 import androidx.media3.datasource.DefaultDataSource
@@ -68,6 +64,7 @@ import androidx.media3.exoplayer.source.ClippingMediaSource
 import androidx.media3.exoplayer.source.MediaSource
 import androidx.media3.exoplayer.source.ProgressiveMediaSource
 import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
+import androidx.media3.session.MediaSession
 import java.io.File
 import java.lang.Exception
 import java.lang.IllegalStateException
@@ -75,7 +72,7 @@ import java.util.*
 import kotlin.math.max
 import kotlin.math.min
 
-internal class BetterPlayer(
+@UnstableApi internal class BetterPlayer(
     context: Context,
     private val eventChannel: EventChannel,
     private val textureEntry: SurfaceTextureEntry,
@@ -90,11 +87,8 @@ internal class BetterPlayer(
     private var surface: Surface? = null
     private var key: String? = null
     private var playerNotificationManager: PlayerNotificationManager? = null
-    private var refreshHandler: Handler? = null
-    private var refreshRunnable: Runnable? = null
-    private var exoPlayerEventListener: Player.Listener? = null
     private var bitmap: Bitmap? = null
-    private var mediaSession: MediaSessionCompat? = null
+    private var mediaSession: MediaSession? = null
     private var drmSessionManager: DrmSessionManager? = null
     private val workManager: WorkManager
     private val workerObserverMap: HashMap<UUID, Observer<WorkInfo?>>
@@ -269,8 +263,6 @@ internal class BetterPlayer(
                                 val outputData = workInfo.outputData
                                 val filePath =
                                     outputData.getString(BetterPlayerPlugin.FILE_PATH_PARAMETER)
-                                //Bitmap here is already processed and it's very small, so it won't
-                                //break anything.
                                 bitmap = BitmapFactory.decodeFile(filePath)
                                 bitmap?.let { bitmap ->
                                     callback.onBitmap(bitmap)
@@ -296,6 +288,7 @@ internal class BetterPlayer(
                 return null
             }
         }
+        
         var playerNotificationChannelName = notificationChannelName
         if (notificationChannelName == null) {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -313,66 +306,30 @@ internal class BetterPlayer(
             }
         }
 
+        setupMediaSession(context)
+
         playerNotificationManager = PlayerNotificationManager.Builder(
             context, NOTIFICATION_ID,
             playerNotificationChannelName!!
         ).setMediaDescriptionAdapter(mediaDescriptionAdapter).build()
 
         playerNotificationManager?.apply {
-
             exoPlayer?.let {
-                setPlayer(ForwardingPlayer(exoPlayer))
+                setPlayer(it)
                 setUseNextAction(false)
                 setUsePreviousAction(false)
                 setUseStopAction(false)
             }
-
-            setupMediaSession(context)?.let {
-                setMediaSessionToken(it.sessionToken)
+            
+            mediaSession?.let {
+                setMediaSessionToken(it.sessionCompatToken)
             }
         }
 
-        refreshHandler = Handler(Looper.getMainLooper())
-        refreshRunnable = Runnable {
-            val playbackState: PlaybackStateCompat = if (exoPlayer?.isPlaying == true) {
-                PlaybackStateCompat.Builder()
-                    .setActions(PlaybackStateCompat.ACTION_SEEK_TO)
-                    .setState(PlaybackStateCompat.STATE_PLAYING, position, 1.0f)
-                    .build()
-            } else {
-                PlaybackStateCompat.Builder()
-                    .setActions(PlaybackStateCompat.ACTION_SEEK_TO)
-                    .setState(PlaybackStateCompat.STATE_PAUSED, position, 1.0f)
-                    .build()
-            }
-            mediaSession?.setPlaybackState(playbackState)
-            refreshHandler?.postDelayed(refreshRunnable!!, 1000)
-        }
-        refreshHandler?.postDelayed(refreshRunnable!!, 0)
-        exoPlayerEventListener = object : Player.Listener {
-            override fun onPlaybackStateChanged(playbackState: Int) {
-                mediaSession?.setMetadata(
-                    MediaMetadataCompat.Builder()
-                        .putLong(MediaMetadataCompat.METADATA_KEY_DURATION, getDuration())
-                        .build()
-                )
-            }
-        }
-        exoPlayerEventListener?.let { exoPlayerEventListener ->
-            exoPlayer?.addListener(exoPlayerEventListener)
-        }
         exoPlayer?.seekTo(0)
     }
 
     fun disposeRemoteNotifications() {
-        exoPlayerEventListener?.let { exoPlayerEventListener ->
-            exoPlayer?.removeListener(exoPlayerEventListener)
-        }
-        if (refreshHandler != null) {
-            refreshHandler?.removeCallbacksAndMessages(null)
-            refreshHandler = null
-            refreshRunnable = null
-        }
         if (playerNotificationManager != null) {
             playerNotificationManager?.setPlayer(null)
         }
@@ -627,32 +584,16 @@ internal class BetterPlayer(
      * @param context                - android context
      * @return - configured MediaSession instance
      */
-    @SuppressLint("InlinedApi")
-    fun setupMediaSession(context: Context?): MediaSessionCompat? {
+    fun setupMediaSession(context: Context?): MediaSession? {
         mediaSession?.release()
         context?.let {
-
-            val mediaButtonIntent = Intent(Intent.ACTION_MEDIA_BUTTON)
-            val pendingIntent = PendingIntent.getBroadcast(
-                context,
-                0, mediaButtonIntent,
-                PendingIntent.FLAG_IMMUTABLE
-            )
-            val mediaSession = MediaSessionCompat(context, TAG, null, pendingIntent)
-            mediaSession.setCallback(object : MediaSessionCompat.Callback() {
-                override fun onSeekTo(pos: Long) {
-                    sendSeekToEvent(pos)
-                    super.onSeekTo(pos)
-                }
-            })
-            mediaSession.isActive = true
-//            val mediaSessionConnector = MediaSessionConnector(mediaSession)
-//            mediaSessionConnector.setPlayer(exoPlayer)
-            this.mediaSession = mediaSession
-            return mediaSession
+            exoPlayer?.let { player ->
+                mediaSession = MediaSession.Builder(context, player)
+                    .build()
+                return mediaSession
+            }
         }
         return null
-
     }
 
     fun onPictureInPictureStatusChanged(inPip: Boolean) {
@@ -662,9 +603,7 @@ internal class BetterPlayer(
     }
 
     fun disposeMediaSession() {
-        if (mediaSession != null) {
-            mediaSession?.release()
-        }
+        mediaSession?.release()
         mediaSession = null
     }
 
